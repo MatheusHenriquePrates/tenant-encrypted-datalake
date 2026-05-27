@@ -1,0 +1,36 @@
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+.env.bak
+.env.bak.*
+
+# Real master key + encrypted credentials — NEVER commit
+keys/
+*.key
+
+# Real tenants config (use config/tenants.example.json as template)
+config/tenants.json
+
+# Build artifacts
+dist/
+node_modules/
+
+# Runtime data
+cache/
+logs/
+*.log
+
+# Backups
+*.bak
+*.bak.*
+*.bak-*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local-only notes
+NOTES.md

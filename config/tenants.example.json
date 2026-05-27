@@ -1,0 +1,47 @@
+{
+  "tenants": [
+    {
+      "id": "acme-co",
+      "name": "ACME Co. (demo)",
+      "bucketName": "datalake-acme-co",
+      "databases": [
+        {
+          "type": "postgresql",
+          "credentialKey": "pg_acme",
+          "name": "acme_app",
+          "schemas": ["public"]
+        }
+      ],
+      "active": true
+    },
+    {
+      "id": "demo-shop",
+      "name": "Demo Shop",
+      "bucketName": "datalake-demo-shop",
+      "databases": [
+        {
+          "type": "mysql",
+          "credentialKey": "mysql_demo_shop",
+          "name": "demo_shop",
+          "schemas": ["demo_shop"]
+        }
+      ],
+      "active": true
+    },
+    {
+      "id": "example-org",
+      "name": "Example Org",
+      "bucketName": "datalake-example-org",
+      "databases": [
+        {
+          "type": "postgresql",
+          "host": "127.0.0.1",
+          "port": 5432,
+          "name": "example_org",
+          "schemas": ["public"]
+        }
+      ],
+      "active": false
+    }
+  ]
+}
