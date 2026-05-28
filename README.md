@@ -1,317 +1,335 @@
-# tenant-encrypted-datalake
+<p align="center">
+  <a href="#-portugu%C3%AAs"><img src="https://img.shields.io/badge/-PT--BR-39d353?style=for-the-badge&labelColor=0d1117" alt="PT-BR"/></a>
+  &nbsp;
+  <a href="#-english"><img src="https://img.shields.io/badge/-EN-58a6ff?style=for-the-badge&labelColor=0d1117" alt="EN"/></a>
+</p>
 
-Multi-tenant data lake with **per-tenant client-side encryption** and a
-**SELECT-only DuckDB proxy** that automatically filters every query by
-`tenant_id`. Designed for the case where:
+<p align="center">
+  <img src="https://capsule-render.vercel.app/api?type=slice&color=0:0d1117,100:39d353&height=180&section=header&text=tenant-encrypted-datalake&fontSize=30&fontColor=ffffff&animation=fadeIn&fontAlignY=42&desc=data%20lake%20multi-tenant%20com%20cripto%20client-side%20por%20tenant&descAlignY=68&descSize=14" width="100%" />
+</p>
 
-- You have several customers' relational data to ingest (Postgres / MySQL)
-- You want to store it cheaply in S3-compatible object storage as Parquet
-- You **cannot** trust the storage layer (cloud provider, ops team,
-  shared bucket) to enforce tenant isolation — so isolation has to be
-  cryptographic, not logical
-- You still want a way to SQL-query the data without re-implementing
-  half of Spark
+<p align="center">
+  <img src="https://readme-typing-svg.demolab.com/?lines=%24+matheus%40devops%3A~%24+tenant-encrypted-datalake;%24+HKDF+por+tenant%2C+AES-256-GCM+com+authTag;%24+Parquet+em+R2%2C+DuckDB+proxy+SELECT-only;%24+inje%C3%A7%C3%A3o+autom%C3%A1tica+de+tenant_id+em+todo+WHERE&font=Fira%20Code&size=18&pause=1200&color=39D353&center=true&vCenter=true&width=720&height=45" />
+</p>
 
-The result: ~1.9 k LoC of TypeScript implementing a Medallion ingestion
-pipeline, an HKDF-derived per-tenant key, AES-256-GCM encryption with
-authenticated tags, and a Fastify proxy that opens Parquet in DuckDB
-on demand, injects the tenant filter, and rejects anything that isn't a
-single `SELECT`.
+<a id="-português"></a>
 
-> **Status: reference implementation.** This is the sanitized public
-> version of a system I run in production. It's intentionally small and
-> single-host so the engineering is easy to read.
+## PT-BR
 
-## Threat model — start here
-
-This is the most important section. Skip it and the rest doesn't matter.
-
-### What this design protects against
-
-1. **A read of the storage bucket** by anyone — including the cloud
-   provider, a misconfigured public ACL, or a compromised ops account.
-   They get ciphertext + IV + auth tag, nothing else. No tenant data
-   is recoverable without the master key.
-
-2. **Cross-tenant data leakage in queries.** The proxy refuses anything
-   that isn't a single `SELECT`, rejects SQL comments, blocks multi-statement
-   queries, and **injects `tenant_id = '<caller>'`** into the WHERE clause
-   before DuckDB executes. A tenant who somehow guesses another tenant's
-   table names still can't read their rows.
-
-3. **Compromise of one tenant's HMAC token.** Tokens are derived from the
-   master key via HKDF with a token-specific info string. Knowing token
-   A doesn't help compute token B.
-
-4. **Accidental ingestion of secrets.** `transformBronze` redacts a
-   denylist of common sensitive column names (`password`, `token`,
-   `api_key`, `ssn`, `cpf`, …) with `[REDACTED]` before anything is
-   persisted.
-
-### What this design does NOT protect against
-
-1. **Loss of the master key.** The master key (`./keys/master.key`)
-   derives every tenant key. If it leaks, **every** tenant's encrypted
-   data becomes readable. Store it like you'd store a root TLS key.
-   This repo's `.gitignore` excludes `keys/` and `*.key`; double-check
-   before you ever `git add -A`.
-
-2. **A compromised host running the ingestion pipeline.** The pipeline
-   process has the master key in RAM and the tenant DB credentials in
-   RAM. Anything that can read its memory (root, debugger, core dump)
-   gets everything.
-
-3. **A compromised host running the proxy.** Same — the proxy holds
-   the master key in memory to derive tenant keys on demand.
-
-4. **DuckDB sandbox escape.** Queries run inside DuckDB. If DuckDB has
-   a bug that allows escaping `SELECT` semantics, the parser-level
-   defense (`validateSQL`) is the only thing standing in between. Keep
-   DuckDB updated.
-
-5. **Side channels** (timing, cache, network). The token comparison in
-   `validateTenantToken` is **string equality**, not constant-time. The
-   threat model assumes the proxy sits on a private network — if you
-   expose it to untrusted clients, swap the comparison for `crypto.timingSafeEqual`.
-
-6. **Untrusted columns making it to Gold.** The denylist in `transformBronze`
-   catches obvious names. A custom column called `acct_secret_v2` will pass
-   through. Audit your tenant schemas; don't rely solely on the denylist.
-
-7. **`HKDF_SALT` rotation.** The salt is a domain separator. **Once you
-   pick a value, never change it** — every previously encrypted file
-   becomes unreadable. The repo default (`tenant-encrypted-datalake-v1`)
-   is fine for a single deployment. Override only if you run multiple
-   independent installations that should never be able to read each
-   other's files.
-
-## Architecture
-
-```
-                  ┌──────────────────────┐    ┌──────────────────────┐
-                  │ Tenant A — Postgres  │    │ Tenant B — MySQL     │
-                  └──────────┬───────────┘    └──────────┬───────────┘
-                             │ SELECT-only readonly creds
-                             ▼                            ▼
-        ┌───────────────────────────────────────────────────────────┐
-        │ Ingestion pipeline   (Medallion: bronze → silver → gold)  │
-        │  - incremental by time column when available              │
-        │  - row-count skip for full-scan tables                    │
-        │  - denylist redaction of `password`, `token`, `ssn`, …    │
-        └───────────────────────────────────────────────────────────┘
-                             │                            │
-                             │  parquet                   │  parquet
-                             ▼                            ▼
-        ┌───────────────────────────────────────────────────────────┐
-        │ AES-256-GCM encryption                                    │
-        │  - tenantKey = HKDF-SHA256(masterKey, salt, tenantId, 32) │
-        │  - file payload: [16B IV][16B authTag][ciphertext]        │
-        └───────────────────────────────────────────────────────────┘
-                             │                            │
-                             ▼                            ▼
-        ┌───────────────────────────────────────────────────────────┐
-        │ Cloudflare R2 (S3-compatible)                             │
-        │  bucket per tenant:  datalake-{tenant_id}                 │
-        │  layout:             {layer}/{table}/year=…/month=…/…     │
-        └───────────────────────────────────────────────────────────┘
-                             ▲
-                             │ GET on demand, decrypt in memory
-        ┌───────────────────────────────────────────────────────────┐
-        │ DuckDB proxy (Fastify, :4500)                             │
-        │  POST /query  { tenantId, token, sql }                    │
-        │   1. validateTenantToken (HKDF-derived HMAC, per tenant)  │
-        │   2. rate limit (100 req/min per tenant)                  │
-        │   3. validateSQL (SELECT-only, no comments, no DDL/DML)   │
-        │   4. fetch latest .parquet.enc from R2                    │
-        │   5. decrypt → /tmp file → DuckDB read_parquet(…)         │
-        │   6. injectTenantFilter (adds  WHERE tenant_id = '…')     │
-        │   7. execute, cache result 5 min, return JSON             │
-        └───────────────────────────────────────────────────────────┘
-                             ▲
-                             │ HTTP
-                       Tenant query client
+```bash
+matheus@devops:~$ cat sobre.txt
 ```
 
-## Quick start
+Data lake multi-tenant com **criptografia client-side por tenant** e um **proxy DuckDB SELECT-only** que filtra automaticamente toda query por `tenant_id`. Pensado pro caso onde:
+
+- Você tem dado relacional de vários customers pra ingerir (Postgres / MySQL)
+- Quer armazenar barato em object storage S3-compatible como Parquet
+- **Não pode** confiar na camada de storage (cloud provider, time de ops, bucket compartilhado) pra enforcar isolamento de tenant — então o isolamento tem que ser criptográfico, não lógico
+- Ainda quer um jeito de fazer SQL no dado sem reimplementar metade do Spark
+
+O resultado: ~1.9k LoC de TypeScript implementando pipeline de ingestion Medallion, key por-tenant derivada via HKDF, criptografia AES-256-GCM com tag autenticada, e proxy Fastify que abre Parquet no DuckDB on-demand, injeta o filtro de tenant, e rejeita qualquer coisa que não seja um único `SELECT`.
+
+> **Status: implementação de referência.** Versão pública sanitizada de um sistema que rodo em produção. Intencionalmente pequeno e single-host pra engenharia ser fácil de ler.
+
+```bash
+matheus@devops:~$ ls stack/
+```
+
+![TypeScript](https://img.shields.io/badge/-TypeScript-0d1117?style=for-the-badge&logo=typescript&logoColor=39d353) ![Node.js](https://img.shields.io/badge/-Node.js-0d1117?style=for-the-badge&logo=node.js&logoColor=39d353) ![PostgreSQL](https://img.shields.io/badge/-PostgreSQL-0d1117?style=for-the-badge&logo=postgresql&logoColor=39d353) ![MySQL](https://img.shields.io/badge/-MySQL-0d1117?style=for-the-badge&logo=mysql&logoColor=39d353) ![DuckDB](https://img.shields.io/badge/-DuckDB-0d1117?style=for-the-badge&logo=duckdb&logoColor=39d353) ![Cloudflare](https://img.shields.io/badge/-Cloudflare%20R2-0d1117?style=for-the-badge&logo=cloudflare&logoColor=39d353) ![Fastify](https://img.shields.io/badge/-Fastify-0d1117?style=for-the-badge&logo=fastify&logoColor=39d353)
+
+```bash
+matheus@devops:~$ cat threat-model.txt
+```
+
+Essa é a seção mais importante. Pula e o resto não importa.
+
+### O que esse design protege
+
+1. **Leitura do bucket de storage** por qualquer um — cloud provider, ACL público mal-configurado, conta de ops comprometida. Ele pega ciphertext + IV + auth tag, nada mais. Nenhum dado de tenant é recuperável sem a master key.
+
+2. **Vazamento de dado cross-tenant em query.** O proxy recusa qualquer coisa que não seja um único `SELECT`, rejeita comentário SQL, bloqueia query multi-statement, e **injeta `tenant_id = '<caller>'`** no WHERE antes do DuckDB executar. Tenant que adivinha nome de tabela do outro ainda não lê os rows.
+
+3. **Comprometimento do token HMAC de um tenant.** Tokens são derivados da master key via HKDF com info string específica de token. Saber token A não ajuda a computar token B.
+
+4. **Ingestão acidental de secret.** `transformBronze` redige um denylist de nomes de coluna comuns sensíveis (`password`, `token`, `api_key`, `ssn`, `cpf`, …) com `[REDACTED]` antes de qualquer coisa ser persistida.
+
+### O que esse design NÃO protege
+
+1. **Perda da master key.** A master key (`./keys/master.key`) deriva toda key de tenant. Se vaza, **todo** dado encriptado de todo tenant vira legível. Guarda como guardaria uma root TLS key. `.gitignore` desse repo exclui `keys/` e `*.key` — confere antes de `git add -A`.
+
+2. **Host comprometido rodando o pipeline.** O processo tem master key na RAM e credencial de banco na RAM. Quem lê a memória (root, debugger, core dump) tem tudo.
+
+3. **Host comprometido rodando o proxy.** Mesmo problema — o proxy mantém master key em memória pra derivar tenant keys on-demand.
+
+4. **Escape do sandbox do DuckDB.** Queries rodam dentro do DuckDB. Se DuckDB tem bug que permite escapar a semântica `SELECT`, a defesa em nível de parser (`validateSQL`) é a única no caminho. Mantém DuckDB atualizado.
+
+5. **Side channels** (timing, cache, network). A comparação de token em `validateTenantToken` é **igualdade de string**, não constant-time. O threat model assume que o proxy fica em rede privada — pra clients não confiáveis, troca por `crypto.timingSafeEqual`.
+
+6. **Coluna não confiável chegando em Gold.** O denylist em `transformBronze` pega nomes óbvios. Uma coluna `acct_secret_v2` passa. Audita os schemas dos tenants; não confia só no denylist.
+
+7. **Rotação do `HKDF_SALT`.** O salt é separador de domínio. **Uma vez escolhido o valor, nunca muda** — todo arquivo previamente encriptado vira ilegível. Default do repo (`tenant-encrypted-datalake-v1`) tá ok pra deploy único.
+
+```bash
+matheus@devops:~$ cat arquitetura.txt
+```
+
+```
+┌──────────────────────┐         ┌──────────────────────┐
+│ Tenant A — Postgres  │         │ Tenant B — MySQL     │
+└──────────┬───────────┘         └──────────┬───────────┘
+           │  SELECT-only readonly creds                │
+           ▼                                            ▼
+┌───────────────────────────────────────────────────────────┐
+│  Pipeline de ingestion (Medallion: bronze → silver → gold)│
+│  - incremental por coluna de tempo quando disponível      │
+│  - skip por row-count em tabela full-scan                 │
+│  - redação por denylist de password, token, ssn, …        │
+└───────────────────────────────────────────────────────────┘
+           │                                            │
+           │  parquet                                   │  parquet
+           ▼                                            ▼
+┌───────────────────────────────────────────────────────────┐
+│            Criptografia AES-256-GCM                       │
+│  - tenantKey = HKDF-SHA256(masterKey, salt, tenantId, 32) │
+│  - payload do arquivo: [16B IV][16B authTag][ciphertext]  │
+└───────────────────────────────────────────────────────────┘
+           │                                            │
+           ▼                                            ▼
+┌───────────────────────────────────────────────────────────┐
+│            Cloudflare R2 (S3-compatible)                  │
+│  bucket por tenant: datalake-{tenant_id}                  │
+│  layout: {layer}/{table}/year=…/month=…/…                 │
+└───────────────────────────────────────────────────────────┘
+                            ▲
+                            │ GET on-demand, decifra em memória
+┌───────────────────────────────────────────────────────────┐
+│                 DuckDB proxy (Fastify, :4500)             │
+│  POST /query { tenantId, token, sql }                     │
+│  1. validateTenantToken (HMAC HKDF-derived, per tenant)   │
+│  2. rate limit (100 req/min por tenant)                   │
+│  3. validateSQL (SELECT-only, sem comentário, sem DDL/DML)│
+│  4. fetch último .parquet.enc do R2                       │
+│  5. decifra → arquivo /tmp → DuckDB read_parquet(…)       │
+│  6. injectTenantFilter (adiciona WHERE tenant_id = '…')   │
+│  7. executa, cacheia resultado 5 min, devolve JSON        │
+└───────────────────────────────────────────────────────────┘
+                            ▲
+                            │ HTTP
+                       Client de query do tenant
+```
+
+```bash
+matheus@devops:~$ ./quick-start.sh
+```
 
 ```bash
 git clone https://github.com/MatheusHenriquePrates/tenant-encrypted-datalake.git
 cd tenant-encrypted-datalake
 
-# 1. Install deps + build
+# 1. Install + build
 npm install
 npm run build
 
-# 2. Configure
+# 2. Configura
 cp .env.example .env
-# edit .env — at minimum set R2_* if you want uploads
 cp config/tenants.example.json config/tenants.json
-# edit config/tenants.json with your tenants
 
-# 3. Generate a master key (one time only, store it like a root TLS key)
+# 3. Gera a master key (uma vez só)
 npm run generate-master-key
 # → Master key generated at ./keys/master.key
-# → Fingerprint: a1b2c3d4e5f60718
 
-# 4. Run the ingestion pipeline once (good for cron)
+# 4. Pipeline one-shot (bom pra cron)
 npm run pipeline
 
-# 5. Or run the long-lived orchestrator (cron-loop inside the process)
+# 5. Ou orchestrator long-lived (cron-loop dentro do processo)
 npm run orchestrator
 
-# 6. Start the query proxy (separate process)
+# 6. Sobe o query proxy (processo separado)
 npm run proxy
 # → DuckDB Proxy listening on http://127.0.0.1:4500
 ```
 
-## Querying
+```bash
+matheus@devops:~$ cat querying.txt
+```
 
-Compute the per-tenant token once (it's deterministic given the master key):
+Computa o token por-tenant uma vez (é determinístico dada a master key):
 
 ```bash
 node -e "
-  const { loadMasterKey, generateTenantToken } = require('./dist/security/keystore.js');
-  const key = loadMasterKey('./keys/master.key');
-  console.log(generateTenantToken(key, 'acme-co'));
+const { loadMasterKey, generateTenantToken } = require('./dist/security/keystore.js');
+const key = loadMasterKey('./keys/master.key');
+console.log(generateTenantToken(key, 'acme-co'));
 "
 ```
 
-Then query:
+Depois consulta:
 
 ```bash
 curl -sS http://localhost:4500/query \
   -H 'Content-Type: application/json' \
   -d '{
     "tenantId": "acme-co",
-    "token":    "<paste-from-above>",
-    "sql":      "SELECT _source_table, COUNT(*) FROM orders GROUP BY 1"
+    "token": "<cola-do-anterior>",
+    "sql": "SELECT _source_table, COUNT(*) FROM orders GROUP BY 1"
   }' | jq
 ```
 
-The proxy will rewrite the SQL to
-`SELECT _source_table, COUNT(*) FROM orders WHERE tenant_id = 'acme-co' GROUP BY 1`
-before running it. If you try `DELETE`, `DROP`, a comment, a second
-statement, or a multi-SELECT chain — the proxy refuses with HTTP 403
-before DuckDB ever sees it.
+O proxy reescreve o SQL pra `SELECT _source_table, COUNT(*) FROM orders WHERE tenant_id = 'acme-co' GROUP BY 1` antes de rodar. Se você tenta `DELETE`, `DROP`, comentário, segundo statement, ou multi-SELECT — o proxy recusa com HTTP 403 antes do DuckDB ver.
 
-## Configuration
+```bash
+matheus@devops:~$ cat config.env
+```
 
-All paths and crypto knobs are env vars — see [`.env.example`](.env.example)
-for the full list with defaults and what each one does. Key ones:
-
-| Variable | Default | What it controls |
+| Variável | Default | Pra quê |
 |---|---|---|
-| `MASTER_KEY_PATH` | `./keys/master.key` | Root key used to derive every tenant key |
-| `HKDF_SALT` | `tenant-encrypted-datalake-v1` | Domain separator — never change after first key generation |
-| `TENANTS_PATH` | `./config/tenants.json` | Tenant list (id, bucketName, databases) |
-| `R2_*` | — | Cloudflare R2 credentials (S3-compatible) |
-| `PROXY_PORT` / `PROXY_HOST` | `4500` / `127.0.0.1` | DuckDB proxy bind |
-| `INGESTION_CRON` | `*/30 * * * *` | Schedule for the long-lived orchestrator |
-| `INGESTION_BATCH_SIZE` | `10000` | Rows per DB query batch |
-| `MAX_ROWS_PER_TABLE` | `100000` | Safety cap per table per cycle |
+| `MASTER_KEY_PATH` | `./keys/master.key` | Root key usada pra derivar toda tenant key |
+| `HKDF_SALT` | `tenant-encrypted-datalake-v1` | Separador de domínio — nunca muda depois da primeira geração de key |
+| `TENANTS_PATH` | `./config/tenants.json` | Lista de tenants (id, bucketName, databases) |
+| `R2_*` | — | Credencial Cloudflare R2 (S3-compatible) |
+| `PROXY_PORT` / `PROXY_HOST` | `4500` / `127.0.0.1` | Bind do proxy DuckDB |
+| `INGESTION_CRON` | `*/30 * * * *` | Schedule do orchestrator long-lived |
+| `INGESTION_BATCH_SIZE` | `10000` | Linhas por batch de query no DB |
+| `MAX_ROWS_PER_TABLE` | `100000` | Cap de segurança por tabela por ciclo |
 
-## Tenants config
-
-`config/tenants.json` is the source of truth for what gets ingested. Each
-tenant has an `id`, a `bucketName`, and a list of databases:
-
-```json
-{
-  "tenants": [
-    {
-      "id": "acme-co",
-      "name": "ACME Co.",
-      "bucketName": "datalake-acme-co",
-      "databases": [
-        {
-          "type": "postgresql",
-          "credentialKey": "pg_acme",
-          "name": "acme_app",
-          "schemas": ["public"]
-        }
-      ],
-      "active": true
-    }
-  ]
-}
+```bash
+matheus@devops:~$ cat medallion-layers.txt
 ```
 
-`credentialKey` looks the credential up in the encrypted credentials
-file (`DB_CREDENTIALS_PATH`). If you don't use that — leave
-`credentialKey` empty and the ingestion will read host/user/password
-from `PG_*` / `MYSQL_*` env vars instead.
+Pra cada batch, o pipeline escreve três arquivos Parquet no R2:
 
-## Medallion layers
+- **Bronze** — rows raw, redigidos pelo denylist, com `_ingested_at`, `_source_table`, `_source_db`, `tenant_id` appendados
+- **Silver** — bronze dedup por primary key (`id` ou `_id`) e com colunas string trimmed
+- **Gold** — agregados diários (ex: `{date: 2026-05-26, record_count: 12}`)
 
-For every batch, the pipeline writes three Parquet files to R2:
+Tabelas full-scan (sem coluna de tempo detectada) usam key fixa `latest.parquet.enc` pra cada ciclo sobrescrever o anterior em vez de acumular.
 
-- **Bronze** — raw rows, denylist-redacted, with `_ingested_at`,
-  `_source_table`, `_source_db`, `tenant_id` appended
-- **Silver** — bronze deduplicated by primary key (`id` or `_id`) and
-  with all string columns trimmed
-- **Gold** — daily aggregates (e.g. `{date: 2026-05-26, record_count: 12}`)
-
-Paths in R2:
-
-```
-bronze/orders/year=2026/month=05/day=26/2026-05-26T03-15-22-001Z.parquet.enc
-silver/orders/year=2026/month=05/day=26/2026-05-26T03-15-22-001Z.parquet.enc
-gold/orders_agg/year=2026/month=05/day=26/2026-05-26T03-15-22-001Z.parquet.enc
+```bash
+matheus@devops:~$ cat limitacoes.txt
 ```
 
-Full-scan tables (no time column detected) use a fixed `latest.parquet.enc`
-key so each cycle overwrites the previous file instead of accumulating.
+- **Design single-host.** Estado (`ingestion-state.json`, lock files) fica em disco local. Múltiplos pipelines contra o mesmo path corrompem os locks.
+- **Sem ingestion streaming.** É batch — tabela de tenant tem no máximo `MAX_ROWS_PER_TABLE` linhas por ciclo. Pra cargas contínuas, usa CDC + fila.
+- **DuckDB in-memory.** Cada query sobe DuckDB in-process, carrega Parquet necessário, roda SQL, fecha. Ótimo pra query analítica pequena, ruim pra latência sub-ms.
+- **Sem row-level access control dentro de um tenant.** Tenants veem todas as linhas das tabelas que acessam. Pra RBAC por-user dentro de tenant, faz por cima.
+- **Sem testes nessa versão pública.** A versão interna tem suite Vitest cobrindo encryption roundtrip, isolamento cross-tenant, e bypass de SQL injection.
 
-## Layout
-
-```
-src/
-├── ingestion/
-│   ├── extract.ts        # Postgres + MySQL extractors, incremental + full-scan
-│   ├── transform.ts      # bronze (redaction), silver (dedup+trim), gold (daily agg)
-│   ├── load.ts           # encrypt + upload to R2 (multipart > 5MB)
-│   ├── pipeline.ts       # one-shot CLI entry — ingest every active tenant
-│   ├── orchestrator.ts   # long-lived process with INGESTION_CRON
-│   └── state.ts          # incremental cursor + per-tenant file locks
-├── proxy/
-│   ├── server.ts         # Fastify, /health + /query + /tenants/:id/*
-│   ├── auth.ts           # HKDF tenant-token validation, rate limit
-│   ├── query.ts          # validateSQL + injectTenantFilter + executeQuery
-│   ├── loader.ts         # fetch + decrypt parquet on demand, 5-min cache
-│   └── cache.ts          # query-result LRU cache, 1k entries / 5-min TTL
-├── security/
-│   ├── keystore.ts       # generate / load master key, HKDF tenant derivation
-│   ├── encryption.ts     # AES-256-GCM with authTag
-│   └── tls.ts            # R2 client factory
-├── config/
-│   ├── credentials.ts    # decrypt the encrypted DB credentials file
-│   ├── database.ts       # createPgPool, createMysqlConnection
-│   ├── r2.ts             # R2 client + bucket path builder
-│   └── tenants.ts        # load tenants.json + active filter
-└── utils/
-    ├── logger.ts         # pino with file + pretty transport
-    └── parquet.ts        # rows → Parquet buffer via DuckDB
+```bash
+matheus@devops:~$ cat LICENSE
 ```
 
-## Limitations
+MIT — veja [LICENSE](LICENSE).
 
-- **Single-host design.** State (`ingestion-state.json`, lock files) is
-  on local disk. Running multiple ingestion pipelines against the same
-  state path will corrupt the locks.
-- **No streaming ingestion.** It's batch — a tenant table can be at most
-  `MAX_ROWS_PER_TABLE` rows per cycle. For larger continuous loads,
-  you'd want CDC + a queue.
-- **DuckDB in-memory.** Every query spins up an in-process DuckDB,
-  loads the needed Parquet files, runs the SQL, closes. Great for small
-  analytical queries, bad for sub-millisecond latency.
-- **No row-level access control inside a tenant.** Tenants see all rows
-  for tables they have access to. If you need per-user RBAC within a
-  tenant, layer it on top.
-- **No tests in this public version.** The internal version has a Vitest
-  suite covering encryption roundtrip, cross-tenant isolation, and SQL
-  injection bypass — they're not included here because they depend on
-  internal test fixtures.
+```bash
+matheus@devops:~$ contact
+```
 
-## License
+[![LinkedIn](https://img.shields.io/badge/-LinkedIn-0d1117?style=for-the-badge&logo=linkedin&logoColor=39d353)](https://www.linkedin.com/in/matheus-henrique-prates-586328234/)
+[![Email](https://img.shields.io/badge/-Email-0d1117?style=for-the-badge&logo=gmail&logoColor=39d353)](mailto:mathues12398henrique@gmail.com)
+
+```bash
+matheus@devops:~$ _
+```
+
+---
+
+<a id="-english"></a>
+
+## EN
+
+```bash
+matheus@devops:~$ cat about.txt
+```
+
+Multi-tenant data lake with **per-tenant client-side encryption** and a **SELECT-only DuckDB proxy** that automatically filters every query by `tenant_id`.
+
+~1.9k LoC of TypeScript implementing a Medallion ingestion pipeline, an HKDF-derived per-tenant key, AES-256-GCM encryption with authenticated tags, and a Fastify proxy that opens Parquet in DuckDB on demand, injects the tenant filter, and rejects anything that isn't a single `SELECT`.
+
+> **Status: reference implementation.** Sanitized public version of a system run in production.
+
+```bash
+matheus@devops:~$ ls stack/
+```
+
+![TypeScript](https://img.shields.io/badge/-TypeScript-0d1117?style=for-the-badge&logo=typescript&logoColor=39d353) ![Node.js](https://img.shields.io/badge/-Node.js-0d1117?style=for-the-badge&logo=node.js&logoColor=39d353) ![PostgreSQL](https://img.shields.io/badge/-PostgreSQL-0d1117?style=for-the-badge&logo=postgresql&logoColor=39d353) ![MySQL](https://img.shields.io/badge/-MySQL-0d1117?style=for-the-badge&logo=mysql&logoColor=39d353) ![DuckDB](https://img.shields.io/badge/-DuckDB-0d1117?style=for-the-badge&logo=duckdb&logoColor=39d353) ![Cloudflare](https://img.shields.io/badge/-Cloudflare%20R2-0d1117?style=for-the-badge&logo=cloudflare&logoColor=39d353) ![Fastify](https://img.shields.io/badge/-Fastify-0d1117?style=for-the-badge&logo=fastify&logoColor=39d353)
+
+```bash
+matheus@devops:~$ cat threat-model.txt
+```
+
+**Protects against:** storage bucket reads (cloud provider, misconfigured ACL, compromised ops account); cross-tenant data leakage in queries; compromise of one tenant's HMAC token; accidental ingestion of secrets (denylist redaction).
+
+**Does NOT protect against:** loss of the master key; compromised host running the pipeline or proxy (key + creds in RAM); DuckDB sandbox escape; side channels; untrusted columns making it to Gold; rotation of `HKDF_SALT` (never change after first key gen).
+
+```bash
+matheus@devops:~$ ./quick-start.sh
+```
+
+```bash
+git clone https://github.com/MatheusHenriquePrates/tenant-encrypted-datalake.git
+cd tenant-encrypted-datalake
+
+npm install
+npm run build
+
+cp .env.example .env
+cp config/tenants.example.json config/tenants.json
+
+npm run generate-master-key
+npm run pipeline
+npm run proxy
+```
+
+```bash
+matheus@devops:~$ cat querying.txt
+```
+
+```bash
+curl -sS http://localhost:4500/query \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "tenantId": "acme-co",
+    "token": "<paste-from-above>",
+    "sql": "SELECT _source_table, COUNT(*) FROM orders GROUP BY 1"
+  }' | jq
+```
+
+The proxy rewrites the SQL to `... WHERE tenant_id = 'acme-co' ...` before running. `DELETE`, `DROP`, comments, multi-statement → HTTP 403 before DuckDB sees it.
+
+```bash
+matheus@devops:~$ cat medallion-layers.txt
+```
+
+- **Bronze** — raw rows, denylist-redacted, with `_ingested_at`, `_source_table`, `_source_db`, `tenant_id` appended
+- **Silver** — bronze deduplicated by primary key and trimmed
+- **Gold** — daily aggregates
+
+```bash
+matheus@devops:~$ cat limitations.txt
+```
+
+- Single-host design (state on local disk).
+- No streaming ingestion (batch only).
+- DuckDB in-memory per query (analytical small queries only).
+- No row-level access control inside a tenant.
+- No tests in this public version.
+
+```bash
+matheus@devops:~$ cat LICENSE
+```
 
 MIT — see [LICENSE](LICENSE).
+
+```bash
+matheus@devops:~$ contact
+```
+
+[![LinkedIn](https://img.shields.io/badge/-LinkedIn-0d1117?style=for-the-badge&logo=linkedin&logoColor=39d353)](https://www.linkedin.com/in/matheus-henrique-prates-586328234/) [![Email](https://img.shields.io/badge/-Email-0d1117?style=for-the-badge&logo=gmail&logoColor=39d353)](mailto:mathues12398henrique@gmail.com)
+
+```bash
+matheus@devops:~$ _
+```
+
+<p align="center">
+  <img src="https://capsule-render.vercel.app/api?type=waving&color=0:39d353,100:0d1117&height=120&section=footer" width="100%" />
+</p>
